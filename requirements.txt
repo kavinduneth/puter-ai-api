@@ -6,3 +6,5 @@ python-dotenv==1.0.1
 requests==2.31.0
 putergenai==0.1.5
 slowapi==0.1.9
+firebase-admin==6.3.0
+pdfplumber==0.10.1
