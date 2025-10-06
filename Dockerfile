@@ -1,18 +1,17 @@
-# Use official Python image (slim for fast build)
-FROM python:3.12-slim
+FROM python:3.11-slim
 
-# Set working directory
+# Install NTP tools
+RUN apt-get update && apt-get install -y ntpdate
+
+# Sync time on startup (ignore errors if restricted)
+RUN ntpdate -s time.nist.gov || true
+
+# Copy app files
+COPY . /app
 WORKDIR /app
 
-# Copy requirements and install dependencies (caches this layer)
-COPY requirements.txt .
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
-COPY . .
-
-# Expose port
-EXPOSE 8000
-
-# Run the app
+# Run FastAPI
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
