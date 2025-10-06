@@ -1,6 +1,5 @@
-
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Form
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from putergenai import PuterClient
 import os
@@ -12,37 +11,88 @@ import asyncio
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+import firebase_admin
+from firebase_admin import credentials, db
+import urllib.parse
+import json
+from pathlib import Path
+import pdfplumber
+from io import BytesIO
+
+# -------------------- Firebase Setup --------------------
+FIREBASE_CRED = "chatapp-37cf0-firebase-adminsdk-9fxgx-ce8bcb0561.json"
+
+if not firebase_admin._apps:
+    cred = credentials.Certificate(FIREBASE_CRED)
+    firebase_admin.initialize_app(cred, {
+        "databaseURL": "https://chatapp-37cf0-default-rtdb.firebaseio.com/"
+    })
+
+# --------------------------------------------------------
 
 # Load environment variables
 load_dotenv()
 
-app = FastAPI(title="Puter AI API Service", description="API for text chat, image recognition, and streaming using Puter AI", version="1.0.0")
+app = FastAPI(title="Puter AI API Service", description="API with Firebase API-key check, TTS, and File Handling", version="1.1.0")
 
-# Rate limiting to manage 100 users
+# Rate limiting
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Load token
-
+# Load Puter token
 client = PuterClient(token='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0IjoiYXUiLCJ2IjoiMC4wLjAiLCJ1dSI6Ik5wNTF4YzQwUXZhVS91N2NZVFRVTWc9PSIsImF1IjoiaWRnL2ZEMDdVTkdhSk5sNXpXUGZhUT09IiwicyI6Inp4YTVmYmhaNXYxc0ZSUWpXT2Ftenc9PSIsImlhdCI6MTc1ODgxOTI2NH0.SW93dRLbHsVg9meoOE8iBrU2HCzmmkCP_gIEzjD4WRU')
 
 class ChatRequest(BaseModel):
     question: str
     model: Optional[str] = "gpt-4.1-nano"
     stream: Optional[bool] = False
+    apikey: str
+    email: str
 
 class ImageRequest(BaseModel):
     image_path_or_url: str
     prompt: Optional[str] = "Describe this image in detail."
     model: Optional[str] = "gpt-4o"
+    apikey: str
+    email: str
 
-class MultiTurnRequest(BaseModel):
-    messages: List[dict]
+class TTSRequest(BaseModel):
+    text: str
+    use_gpt: Optional[bool] = False
     model: Optional[str] = "gpt-4.1-nano"
-    stream: Optional[bool] = False
+    language: Optional[str] = "en"
+    apikey: str
+    email: str
 
-# Helper function for AI chat with timeout
+class FileRequest(BaseModel):
+    prompt: Optional[str] = "Analyze this file and provide insights."
+    model: Optional[str] = "gpt-4.1-nano"
+    apikey: str
+    email: str
+
+# ---------------- Helper: Verify API key and increment usage ----------------
+async def verify_apikey(email: str, apikey: str) -> bool:
+    """
+    Check if apikey exists under email in Firebase Realtime DB.
+    If valid, increment `apicalls` for that specific API key.
+    """
+    safe_email = email.replace(".", "_")
+    ref_path = f"users/{safe_email}"
+    user_ref = db.reference(ref_path)
+    data = user_ref.get()
+
+    if not data:
+        return False
+    
+    for key_id, record in data.items():
+        if "apikey" in record and record["apikey"] == apikey:
+            apicalls = record.get("apicalls", 0)
+            user_ref.child(key_id).update({"apicalls": apicalls + 1})
+            return True
+    return False
+
+# ---------------- AI Chat Helpers ----------------
 async def _ai_chat_with_timeout(messages: List[dict], options: dict, timeout: int = 30):
     try:
         response = await asyncio.wait_for(
@@ -55,55 +105,124 @@ async def _ai_chat_with_timeout(messages: List[dict], options: dict, timeout: in
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI chat error: {str(e)}")
 
-# Streaming response generator
 async def stream_chat_response(messages: List[dict], options: dict) -> AsyncGenerator[str, None]:
     try:
         response = await _ai_chat_with_timeout(messages, options)
-        for chunk, _ in response:
-            yield chunk  # Yield each token for real-time streaming
+        async for chunk, _ in response:
+            if chunk.strip():
+                yield chunk
     except Exception as e:
         yield f"Error streaming response: {str(e)}"
 
-# Text chat endpoint (GET for simple URL calls)
+# ---------------- TTS Helper ----------------
+def generate_tts(text: str, language: str = "en") -> bytes:
+    """
+    Generate TTS audio using Google Translate TTS API.
+    """
+    try:
+        encoded_text = urllib.parse.quote(text)
+        tts_url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={encoded_text}&tl={language}&client=tw-ob"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        response = requests.get(tts_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        if len(response.content) < 100:
+            raise HTTPException(status_code=500, detail="Invalid TTS audio data")
+        return response.content
+    except requests.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"TTS generation error: {str(e)}")
+
+# ---------------- File Handling Helper ----------------
+async def process_file_content(file: UploadFile, max_size_mb: int = 5) -> str:
+    """
+    Read and encode file content. Supports text, JSON, and PDF; rejects oversized files.
+    """
+    max_size_bytes = max_size_mb * 1024 * 1024
+    content_type = file.content_type
+
+    try:
+        # Read file content asynchronously
+        content = await file.read()
+        file_size = len(content)
+        if file_size > max_size_bytes:
+            raise HTTPException(status_code=400, detail=f"File size exceeds {max_size_mb}MB limit")
+
+        # Handle based on content type
+        if content_type in ["text/plain", "application/json"]:
+            try:
+                return content.decode("utf-8")
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=400, detail="File must be valid UTF-8 text")
+        elif content_type == "application/pdf":
+            try:
+                with pdfplumber.open(BytesIO(content)) as pdf:
+                    text = ""
+                    for page in pdf.pages:
+                        text += page.extract_text() or ""
+                    if not text.strip():
+                        raise HTTPException(status_code=400, detail="No text could be extracted from the PDF")
+                    return text
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"PDF processing error: {str(e)}")
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Use text, JSON, or PDF")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"File processing error: {str(e)}")
+    finally:
+        await file.close()
+
+# ---------------- Endpoints ----------------
+
 @app.get("/chat")
 @limiter.limit("10/minute")
 async def chat_get(
-    request: Request,  # Added for slowapi
+    request: Request,
     question: str = Query(..., description="The question to ask"),
     model: str = Query("gpt-4.1-nano", description="AI model to use"),
-    stream: bool = Query(False, description="Enable streaming response")
+    stream: bool = Query(False, description="Enable streaming response"),
+    apikey: str = Query(..., description="API key of the user"),
+    email: str = Query(..., description="Email of the user")
 ):
+    if not await verify_apikey(email, apikey):
+        raise HTTPException(status_code=401, detail="Invalid API key or email")
+
     messages = [{"role": "user", "content": question}]
-    options = {
-        "model": model,
-        "strict_model": True,
-        "temperature": 1,
-        "stream": stream
-    }
+    options = {"model": model, "strict_model": True, "temperature": 1, "stream": stream}
     
     if stream:
         return StreamingResponse(
             stream_chat_response(messages, options),
-            media_type="text/plain"
+            media_type="text/plain",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
         )
     
-    try:
-        response = await _ai_chat_with_timeout(messages, options)
-        content = response["response"]["result"]["message"]["content"]
-        used_model = response["used_model"]
-        return {"answer": content, "model_used": used_model}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI chat error: {str(e)}")
+    response = await _ai_chat_with_timeout(messages, options)
+    content = response["response"]["result"]["message"]["content"]
+    used_model = response["used_model"]
+    return {"answer": content, "model_used": used_model}
 
 @app.post("/chat")
 @limiter.limit("10/minute")
 async def chat_post(request: Request, chat_request: ChatRequest):
-    return await chat_get(request, chat_request.question, chat_request.model, chat_request.stream)
+    if not await verify_apikey(chat_request.email, chat_request.apikey):
+        raise HTTPException(status_code=401, detail="Invalid API key or email")
 
-# Image recognition endpoint
+    return await chat_get(
+        request,
+        chat_request.question,
+        chat_request.model,
+        chat_request.stream,
+        chat_request.apikey,
+        chat_request.email
+    )
+
 @app.post("/recognize-image")
 @limiter.limit("5/minute")
 async def recognize_image(request: Request, image_request: ImageRequest):
+    if not await verify_apikey(image_request.email, image_request.apikey):
+        raise HTTPException(status_code=401, detail="Invalid API key or email")
+
     if image_request.image_path_or_url.startswith(("http://", "https://")):
         try:
             response = requests.head(image_request.image_path_or_url, timeout=5)
@@ -137,28 +256,50 @@ async def recognize_image(request: Request, image_request: ImageRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image recognition error: {str(e)}")
 
-# Streaming chat endpoint for real-time token output
-@app.get("/stream-chat")
+@app.post("/tts")
 @limiter.limit("10/minute")
-async def stream_chat(
-    request: Request,  # Added for slowapi
-    question: str = Query(..., description="The question to ask"),
-    model: str = Query("gpt-4.1-nano", description="AI model to use")
-):
-    messages = [{"role": "user", "content": question}]
-    options = {
-        "model": model,
-        "strict_model": True,
-        "temperature": 1,
-        "stream": True
-    }
-    
-    return StreamingResponse(
-        stream_chat_response(messages, options),
-        media_type="text/plain"
-    )
+async def tts(request: Request, tts_request: TTSRequest):
+    if not await verify_apikey(tts_request.email, tts_request.apikey):
+        raise HTTPException(status_code=401, detail="Invalid API key or email")
 
-# Health check
+    try:
+        text_to_speak = tts_request.text
+        if tts_request.use_gpt:
+            messages = [{"role": "user", "content": tts_request.text}]
+            options = {"model": tts_request.model, "strict_model": True, "temperature": 1}
+            response = await _ai_chat_with_timeout(messages, options)
+            text_to_speak = response["response"]["result"]["message"]["content"]
+
+        audio_bytes = generate_tts(text_to_speak, tts_request.language)
+        return Response(content=audio_bytes, media_type="audio/mpeg")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS error: {str(e)}")
+
+@app.post("/file-analyze")
+@limiter.limit("5/minute")
+async def file_analyze(
+    request: Request,
+    file: UploadFile = File(...),
+    prompt: str = Form("Analyze this file and provide insights."),
+    model: str = Form("gpt-4.1-nano"),
+    apikey: str = Form(...),
+    email: str = Form(...)
+):
+    if not await verify_apikey(email, apikey):
+        raise HTTPException(status_code=401, detail="Invalid API key or email")
+
+    try:
+        file_content = await process_file_content(file)
+        messages = [{"role": "user", "content": f"{prompt}\n\nFile content:\n{file_content}"}]
+        options = {"model": model, "strict_model": True, "temperature": 1}
+
+        response = await _ai_chat_with_timeout(messages, options)
+        content = response["response"]["result"]["message"]["content"]
+        used_model = response["used_model"]
+        return {"analysis": content, "model_used": used_model}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File analysis error: {str(e)}")
+
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
