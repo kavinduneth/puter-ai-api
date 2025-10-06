@@ -1,0 +1,5 @@
+*.json  # Or specifically: chatapp-37cf0-firebase-adminsdk-9fxgx-ce8bcb0561.json
+.env
+*.key
+*.pem
+__pycache__/
