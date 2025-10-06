@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 import pdfplumber
 from io import BytesIO
-
+import time
 # -------------------- Firebase Setup --------------------
 FIREBASE_CRED = "chatapp-37cf0-firebase-adminsdk-9fxgx-ce8bcb0561.json"
 
@@ -34,6 +34,7 @@ if not firebase_admin._apps:
 load_dotenv()
 
 app = FastAPI(title="Puter AI API Service", description="API with Firebase API-key check, TTS, and File Handling", version="1.1.0")
+
 
 # Rate limiting
 limiter = Limiter(key_func=get_remote_address)
@@ -71,6 +72,23 @@ class FileRequest(BaseModel):
     apikey: str
     email: str
 
+@app.get("/check-time-sync")
+async def check_time_sync():
+    try:
+        local_utc = datetime.utcnow().isoformat()
+        resp = requests.get("http://worldtimeapi.org/api/timezone/UTC", timeout=5)
+        resp.raise_for_status()
+        google_utc = resp.json()["utc_datetime"]
+        skew = (datetime.fromisoformat(local_utc.replace('Z', '+00:00')) - 
+                datetime.fromisoformat(google_utc)).total_seconds()
+        return {
+            "local_utc": local_utc,
+            "google_utc": google_utc,
+            "skew_seconds": skew,
+            "is_issue": abs(skew) > 300  # True if skew > 5 min
+        }
+    except Exception as e:
+        return {"error": str(e)}
 # ---------------- Helper: Verify API key and increment usage ----------------
 async def verify_apikey(email: str, apikey: str) -> bool:
     """
