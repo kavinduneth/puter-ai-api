@@ -11,30 +11,28 @@ import asyncio
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-import firebase_admin
-from firebase_admin import credentials, db
+from supabase import create_client, Client  # ✅ Add this
 import urllib.parse
 import json
 from pathlib import Path
 import pdfplumber
 from io import BytesIO
 import time
-# -------------------- Firebase Setup --------------------
-FIREBASE_CRED = "chatapp-37cf0-firebase-adminsdk-9fxgx-ce8bcb0561.json"
-
-if not firebase_admin._apps:
-    cred = credentials.Certificate(FIREBASE_CRED)
-    firebase_admin.initialize_app(cred, {
-        "databaseURL": "https://chatapp-37cf0-default-rtdb.firebaseio.com/"
-    })
 
 # --------------------------------------------------------
 
 # Load environment variables
+# Load environment variables
 load_dotenv()
 
-app = FastAPI(title="Puter AI API Service", description="API with Firebase API-key check, TTS, and File Handling", version="1.1.0")
+# -------------------- Supabase Setup --------------------
+SUPABASE_URL = "https://ebtqetaxmpfbarkcturc.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVidHFldGF4bXBmYmFya2N0dXJjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk5MzczNjcsImV4cCI6MjA3NTUxMzM2N30.Ekg8ylQ4E84bCilGCDQLM6GO9ju7lv8nbFNc2zJ1lz0"
 
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# --------------------------------------------------------
+
+app = FastAPI(title="Puter AI API Service", description="API with Supabase API-key check, TTS, and File Handling", version="2.0.0")
 
 # Rate limiting
 limiter = Limiter(key_func=get_remote_address)
@@ -42,11 +40,11 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Load Puter token
-client = PuterClient(token='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0IjoiYXUiLCJ2IjoiMC4wLjAiLCJ1dSI6Ik5wNTF4YzQwUXZhVS91N2NZVFRVTWc9PSIsImF1IjoiaWRnL2ZEMDdVTkdhSk5sNXpXUGZhUT09IiwicyI6Inp4YTVmYmhaNXYxc0ZSUWpXT2Ftenc9PSIsImlhdCI6MTc1ODgxOTI2NH0.SW93dRLbHsVg9meoOE8iBrU2HCzmmkCP_gIEzjD4WRU')
+client = PuterClient(token='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0IjoiYXUiLCJ2IjoiMC4wLjAiLCJ1dSI6Ik5wNTF4YzQwUXZhVS91N2NZVFRVTWc9PSIsImF1IjoiaWRnL2ZEMDdVTkdhSk5sNXpXUGZhUT09IiwicyI6Inp4YTVmYmhaNXYxc0ZSUWpXT2Ftenc9PSIsImlhdCI6MTc2MDA4MDg2M30.FtwaKqFabzLsRJVDd_FbQKzHP2ZMhwM-FMoMb14E9J8')
 
 class ChatRequest(BaseModel):
     question: str
-    model: Optional[str] = "gpt-4.1-nano"
+    model: Optional[str] = "grok-beta"
     stream: Optional[bool] = False
     apikey: str
     email: str
@@ -72,46 +70,62 @@ class FileRequest(BaseModel):
     apikey: str
     email: str
 
-@app.get("/check-time-sync")
-async def check_time_sync():
-    try:
-        local_utc = datetime.utcnow().isoformat()
-        resp = requests.get("http://worldtimeapi.org/api/timezone/UTC", timeout=5)
-        resp.raise_for_status()
-        google_utc = resp.json()["utc_datetime"]
-        skew = (datetime.fromisoformat(local_utc.replace('Z', '+00:00')) - 
-                datetime.fromisoformat(google_utc)).total_seconds()
-        return {
-            "local_utc": local_utc,
-            "google_utc": google_utc,
-            "skew_seconds": skew,
-            "is_issue": abs(skew) > 300  # True if skew > 5 min
-        }
-    except Exception as e:
-        return {"error": str(e)}
+# ---------------- Helper: Verify API key and increment usage ----------------
 # ---------------- Helper: Verify API key and increment usage ----------------
 async def verify_apikey(email: str, apikey: str) -> bool:
     """
-    Check if apikey exists under email in Firebase Realtime DB.
-    If valid, increment `apicalls` for that specific API key.
+    Check if apikey exists for the given email in Supabase.
+    If valid, check API call limit and increment `apicalls` for that specific API key.
     """
-    safe_email = email.replace(".", "_")
-    ref_path = f"users/{safe_email}"
-    user_ref = db.reference(ref_path)
-    data = user_ref.get()
-
-    if not data:
-        return False
-    
-    for key_id, record in data.items():
-        if "apikey" in record and record["apikey"] == apikey:
-            apicalls = record.get("apicalls", 0)
-            user_ref.child(key_id).update({"apicalls": apicalls + 1})
+    try:
+        # Search for the API key with matching email
+        response = supabase.table('users')\
+            .select('*')\
+            .eq('email', email)\
+            .eq('apikey', apikey)\
+            .execute()
+        
+        # Check if any matching record found
+        if not response.data or len(response.data) == 0:
+            print(f"❌ No matching API key found for email: {email}")
+            return False
+        
+        # Get the first matching record
+        record = response.data[0]
+        current_calls = record.get('apicalls', 0)
+        
+        # Check if user has exceeded the limit
+        if current_calls >= 500:
+            print(f"⚠️ API call limit exceeded for {email}. Current calls: {current_calls}")
+            raise HTTPException(
+                status_code=429, 
+                detail="API call limit exceeded (500 calls). Please contact the web admin at support@example.com for more API calls."
+            )
+        
+        # Increment API calls using email and apikey as identifiers
+        update_response = supabase.table('users')\
+            .update({'apicalls': current_calls + 1})\
+            .eq('email', email)\
+            .eq('apikey', apikey)\
+            .execute()
+        
+        if update_response.data:
+            print(f"✅ API call incremented for {email}. Total calls: {current_calls + 1}/500")
             return True
-    return False
-
+        else:
+            print(f"⚠️ Failed to increment API calls for {email}")
+            return False
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions (like the 429 limit exceeded)
+        raise
+    except Exception as e:
+        print(f"❌ Error verifying API key: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
 # ---------------- AI Chat Helpers ----------------
-async def _ai_chat_with_timeout(messages: List[dict], options: dict, timeout: int = 30):
+async def _ai_chat_with_timeout(messages: List[dict], options: dict, timeout: int = 200):
     try:
         response = await asyncio.wait_for(
             asyncio.to_thread(client.ai_chat, messages=messages, options=options),
